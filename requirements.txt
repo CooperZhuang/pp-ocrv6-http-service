@@ -1,0 +1,14 @@
+# PP-OCRv6 通用 OCR 依赖 (HTTP 公共服务, ONNX Runtime 默认引擎)
+# 默认引擎 onnxruntime: 无需 paddlepaddle / CUDA, 任何 Windows 机器可跑 (CPU 单张约 1.9s)
+# 安装: uv pip install --python <venv-python> -r requirements.txt
+#
+# GPU 加速(可选): 用 --engine paddle 需另装 paddlepaddle(-gpu), 二选一且二者都提供 paddle 模块:
+#   CPU 机器:  paddlepaddle==3.3.1            (默认 PyPI 即可装)
+#   GPU 机器:  paddlepaddle-gpu==3.3.1        (Paddle 官方源, 自带 CUDA/cuDNN, 驱动>=550.54.14)
+#             uv pip install --python <venv-python> --index-url https://www.paddlepaddle.org.cn/packages/stable/cu126/ paddlepaddle-gpu==3.3.1
+paddleocr>=3.7.0,<3.8.0
+onnxruntime
+paddle2onnx
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+python-multipart

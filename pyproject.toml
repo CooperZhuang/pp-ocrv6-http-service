@@ -1,0 +1,60 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pp-ocrv6-service"
+version = "2.0.0"
+description = "PP-OCRv6 本机 HTTP OCR 公共服务 (ONNX Runtime, 子进程隔离, 免 GPU)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+keywords = ["ocr", "pdf", "invoice", "onnxruntime", "fastapi"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov", "httpx", "ruff", "mypy"]
+gpu = ["paddlepaddle-gpu==3.3.1"]
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra -m 'not integration'"
+markers = [
+    "integration: 需要真实模型的冒烟/集成测试(用 `-m integration` 运行)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore:Using .httpx. with .starlette.testclient. is deprecated",
+]
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true       # 第三方无 stubs(paddleocr/onnxruntime 等)
+check_untyped_defs = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+
+# ---------------------------------------------------------------- coverage
+[tool.coverage.run]
+branch = true
+source = ["ocr_service.py"]
+
+[tool.coverage.report]
+skip_covered = true
+omit = ["tests/*"]
+show_missing = true
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["ocr_service.py", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM"]
+ignore = [
+    "E501",        # 行长由 formatter 控制
+    "B905",        # zip 无需 strict(兼容性)
+    "B008",        # FastAPI 必需: File(...)/Body(...) 在参数默认值里
+]
