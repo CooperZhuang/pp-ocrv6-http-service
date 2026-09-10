@@ -1,0 +1,10 @@
+# Windows batch files and script hosts must use CRLF line endings.
+#
+# cmd.exe mis-parses LF-only batch files once they grow: an 8KB LF-only
+# deploy_env.bat had its REM/echo lines executed as commands from
+# arbitrary byte offsets, while the smaller LF-only scripts happened to
+# survive. Keep *.bat / *.cmd / *.vbs checked out as CRLF everywhere so a
+# clone, a USB copy and the working tree all behave identically.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.vbs text eol=crlf

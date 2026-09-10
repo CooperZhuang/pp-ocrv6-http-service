@@ -3,20 +3,25 @@ REM ============================================================
 REM  deploy_env.bat - One-click environment setup for the
 REM  PP-OCRv6 HTTP OCR service on a fresh deployment machine.
 REM
-REM  Requirements on the target machine:
-REM    * uv in PATH        (https://docs.astral.sh/uv/)
-REM    * internet access   (uv fetches CPython 3.11 + PyPI deps)
-REM  Python does NOT need to be installed: uv downloads CPython
-REM  3.11 by itself, which is the version this project is
-REM  verified against (CI matrix and local dev are both 3.11).
+REM  Preferred path (uv in PATH + internet):
+REM    uv fetches CPython 3.11 by itself, so the target machine
+REM    does NOT need Python preinstalled. 3.11 is the version this
+REM    project is verified against (CI matrix and local dev).
+REM
+REM  Fallback path (no uv): uses the system `python` + pip.
+REM    Requires Python 3.11~3.13 to be installed already; 3.12/3.13
+REM    are accepted with a warning (verified on 3.11 only), and
+REM    anything outside 3.11~3.13 is rejected with a clear message.
+REM    Force this path with --pip.
 REM
 REM  What it does:
-REM    [1/4] check uv                [2/4] create .venv (CPython 3.11)
-REM    [3/4] install requirements    [4/4] verify imports + versions
+REM    [1/4] check toolchain        [2/4] create .venv (+ version gate)
+REM    [3/4] install requirements   [4/4] verify imports + versions
 REM
 REM  Usage:
 REM    bin\deploy_env.bat                 setup (re-runnable; keeps .venv)
 REM    bin\deploy_env.bat --recreate      delete .venv first, rebuild
+REM    bin\deploy_env.bat --pip           force the pip fallback (no uv)
 REM    bin\deploy_env.bat --no-pause      do not pause at the end
 REM
 REM  Next: bin\selftest_ocr.bat   (first run downloads models, ~146MB)
@@ -29,10 +34,12 @@ set "PYTHONUTF8=1"
 
 set "PAUSE_AT_END=1"
 set "RECREATE="
+set "FORCE_PIP="
 :parse_args
 if "%~1"=="" goto args_done
 if /i "%~1"=="--no-pause" set "PAUSE_AT_END="
 if /i "%~1"=="--recreate" set "RECREATE=1"
+if /i "%~1"=="--pip" set "FORCE_PIP=1"
 if /i "%~1"=="-h" goto usage
 if /i "%~1"=="--help" goto usage
 shift
@@ -42,6 +49,7 @@ goto parse_args
 set "VENV_DIR=.venv"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "REQ=requirements.txt"
+set "CREATED_VENV="
 
 echo ============================================================
 echo  PP-OCRv6 HTTP OCR service - environment setup
@@ -58,21 +66,29 @@ if not exist "%REQ%" (
 REM ====== disk space (informational) ======
 for %%d in ("%~d0") do set "DRVLETTER=%%~d"
 for /f "delims=" %%f in ('powershell -NoProfile -Command "[math]::Round((Get-PSDrive %DRVLETTER:~0,1%).Free/1GB,1)" 2^>nul') do set "FREE_GB=%%f"
-if defined FREE_GB echo Free space on %DRVLETTER% %FREE_GB% GB ^(venv ~3 GB + models ~0.15 GB; 5 GB recommended^)
+if defined FREE_GB echo Free space on %DRVLETTER% %FREE_GB% GB ^(venv ~0.6 GB + models ~0.15 GB; 2 GB recommended^)
 echo.
 
-REM ====== [1/4] uv ======
-echo [1/4] Checking uv ...
-where uv >nul 2>nul
-if errorlevel 1 (
-    echo ERROR: uv not found in PATH.
-    echo        Install it first ^(no admin needed^), then open a NEW terminal:
-    echo          powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
-    echo.
-    echo        No uv? Use prepare_env.bat instead ^(pip fallback, needs Python 3.11^).
-    goto fail
+REM ====== [1/4] toolchain: uv (preferred) or python (fallback) ======
+set "UV="
+if not defined FORCE_PIP where uv >nul 2>nul && set "UV=uv"
+echo [1/4] Checking the toolchain ...
+if defined UV (
+    for /f "delims=" %%V in ('uv --version') do echo       uv     %%V
+    echo       mode   uv  ^(CPython 3.11 is fetched automatically^)
+) else (
+    if defined FORCE_PIP echo       --pip given: skipping uv on purpose.
+    where python >nul 2>nul
+    if errorlevel 1 (
+        echo ERROR: neither uv nor python is available.
+        echo        Install uv ^(recommended, no admin needed^), then open a NEW terminal:
+        echo          powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
+        goto fail
+    )
+    for /f "delims=" %%V in ('python -c "import sys;print(sys.version.split()[0], sys.executable)"') do echo       python %%V
+    echo       mode   pip fallback  ^(needs Python 3.11~3.13; 3.11 recommended^)
 )
-for /f "delims=" %%V in ('uv --version') do echo       %%V
+echo.
 
 REM ====== [2/4] virtual environment ======
 if defined RECREATE if exist "%VENV_DIR%" (
@@ -85,28 +101,63 @@ if defined RECREATE if exist "%VENV_DIR%" (
 )
 if exist "%VENV_PY%" (
     echo [2/4] Reusing existing venv %VENV_DIR% ...
-) else (
+) else if defined UV (
     echo [2/4] Creating venv with CPython 3.11 ^(uv downloads it if needed^) ...
     uv venv --python 3.11 "%VENV_DIR%"
     if errorlevel 1 (
         echo ERROR: failed to create the virtual environment.
         goto fail
     )
+    set "CREATED_VENV=1"
+) else (
+    echo [2/4] Creating venv with the system python ...
+    python -m venv "%VENV_DIR%"
+    if errorlevel 1 (
+        echo ERROR: failed to create the virtual environment.
+        goto fail
+    )
+    set "CREATED_VENV=1"
 )
 if not exist "%VENV_PY%" (
     echo ERROR: %VENV_PY% not found after venv creation.
     goto fail
 )
-echo       interpreter:
-"%VENV_PY%" -c "import sys;print('      ',sys.executable);print('      Python',sys.version.split()[0])"
+
+REM 版本门禁: <3.11 或 >=3.14 直接拒绝, 3.12/3.13 放行但告警
+"%VENV_PY%" -c "import sys;sys.exit(0 if (3,11)<=sys.version_info[:2]<(3,14) else 1)"
 if errorlevel 1 (
-    echo ERROR: the venv interpreter does not run.
+    echo.
+    echo ERROR: unsupported Python interpreter:
+    "%VENV_PY%" -c "import sys;print('      ',sys.version.split()[0],sys.executable)"
+    echo        This project is verified on CPython 3.11 only.
+    if defined CREATED_VENV (
+        echo        Removing the venv just created ...
+        rmdir /s /q "%VENV_DIR%"
+    )
+    echo        Recommended fix - install uv so this script fetches 3.11:
+    echo          powershell -c "irm https://astral.sh/uv/install.ps1 ^| iex"
+    echo        Then re-run:  bin\deploy_env.bat
     goto fail
 )
+"%VENV_PY%" -c "import sys;print('      interpreter:',sys.executable);print('      Python     ',sys.version.split()[0])"
+"%VENV_PY%" -c "import sys;sys.exit(0 if sys.version_info[:2]==(3,11) else 1)"
+if errorlevel 1 echo       WARN: not 3.11 - the project is only verified on CPython 3.11.
+echo.
 
 REM ====== [3/4] dependencies ======
-echo [3/4] Installing dependencies from %REQ% ...
-uv pip install --python "%VENV_PY%" -r "%REQ%"
+if defined UV (
+    echo [3/4] Installing dependencies with uv pip ...
+    uv pip install --python "%VENV_PY%" -r "%REQ%"
+) else (
+    "%VENV_PY%" -m pip --version >nul 2>nul
+    if errorlevel 1 (
+        echo [3/4] Bootstrapping pip into the venv ...
+        "%VENV_PY%" -m ensurepip --upgrade >nul 2>&1
+    )
+    echo [3/4] Installing dependencies with pip ...
+    "%VENV_PY%" -m pip install --upgrade pip >nul 2>&1
+    "%VENV_PY%" -m pip install -r "%REQ%"
+)
 if errorlevel 1 (
     echo.
     echo ERROR: dependency installation failed.
@@ -114,6 +165,7 @@ if errorlevel 1 (
     echo        paddlepaddle / paddlepaddle-gpu on a machine without an NVIDIA GPU.
     goto fail
 )
+echo.
 
 REM ====== [4/4] verify ======
 echo [4/4] Verifying the environment ...
@@ -127,7 +179,7 @@ if errorlevel 1 (
 echo.
 echo ============================================================
 echo  Environment ready.
-echo    venv : %VENV_DIR%  ^(CPython 3.11^)
+echo    venv : %VENV_DIR%
 echo    deps : installed from %REQ%
 echo.
 echo  Next steps:
@@ -139,8 +191,9 @@ if defined PAUSE_AT_END pause
 exit /b 0
 
 :usage
-echo Usage: bin\deploy_env.bat [--recreate] [--no-pause]
+echo Usage: bin\deploy_env.bat [--recreate] [--pip] [--no-pause]
 echo   --recreate   remove .venv first and rebuild it from scratch
+echo   --pip        force the pip fallback path (skip uv)
 echo   --no-pause   do not wait for a key press at the end
 if defined PAUSE_AT_END pause
 exit /b 0
