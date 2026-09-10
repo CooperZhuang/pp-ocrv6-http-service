@@ -3,6 +3,9 @@ REM ============================================================
 REM  prepare_env.bat - Prepare the Python environment for the
 REM  PP-OCRv6 HTTP OCR service (for deployment on other machines).
 REM
+REM  NOTE: 推荐用 bin\deploy_env.bat (uv + CPython 3.11 + 依赖 + 环境自检);
+REM        本脚本是本机「没有 uv」时的 pip 回退路径, 要求系统已有 Python 3.11.
+REM
 REM  优先使用 uv 安装依赖; 若本机无 uv 或 uv 安装失败, 自动回退
 REM  到普通 pip 方式. 适配未装 GPU/CUDA 的任意 Windows 机器.
 REM
