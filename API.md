@@ -63,14 +63,26 @@
 
 ### 子进程隔离（内存行为）
 
-推理在**子进程**里运行，父进程（HTTP 服务）仅 ~52MB：
+推理在**子进程**里运行，父进程（HTTP 服务）实测仅 ~51MB：
 
 - 启动/空闲：`model_loaded=false`，无子进程。
-- 首次 `/ocr`：启动子进程加载模型（~1.5GB，冷启动约 3~5s），`model_loaded=true`。
+- 首次 `/ocr`：启动子进程加载模型（常驻 ~0.9GB / 提交 ~1.6GB，冷启动实测 2.4s），`model_loaded=true`。
 - 空闲超过 `idle_unload_s` 秒：杀掉子进程，模型内存全部归还系统，`model_loaded=false`。
-- 下次 `/ocr`：重新冷启动子进程（约 3~5s）。
+- 下次 `/ocr`：重新冷启动子进程（实测 2.4s）。
 
 `GET /health` 的 `model_loaded` 反映当前是否已有推理子进程（模型）在运行。
+
+## 性能与并发
+
+- **耗时口径**：开发机（Ryzen 7 9700X）实测 900×600 小图 **0.33s**、A4 300dpi 整页
+  （2480×3508）**2.59s**。文本行数越多 rec 越慢，请按自己的票据实测。
+- **严格串行**：同一请求里的多个 `files` 按顺序逐个识别；服务端还有全局锁，多个并发请求
+  也只会排队执行。**并发上传不会更快**，吞吐 ≈ 1 / 单张耗时。
+- **单核瓶颈**：`OMP_NUM_THREADS` 从 1 调到 16 几乎不改变耗时，OCR 只占约 1 个核。
+- **批量建议**：单个请求控制在 10~20 个文件，并把调用方 HTTP 超时设宽
+  （A4 整页按 2~10s/页估算，多页 PDF 线性叠加，冷启动另加 2~5s）。
+- 首次请求会把推理子进程拉起到常驻 ~0.9GB（提交 ~1.6GB），空闲 `idle_unload_s` 秒后释放，
+  所以「空闲后第一个请求」要预留冷启动时间。
 
 ## 就绪探测
 
@@ -170,17 +182,22 @@ curl -s -X POST http://127.0.0.1:18010/ocr \
 
 ## 跨机器部署（免 GPU）
 
-默认引擎为 `onnxruntime`，**无需** paddlepaddle / CUDA。在目标 Windows 机器上：
+默认引擎为 `onnxruntime`，**无需** paddlepaddle / CUDA。目标机需要 Windows x64 + `uv` + 互联网
+（uv 会自动下载 CPython 3.11，无需预装 Python）：
 
 ```bash
-python -m venv .venv
-.venv\Scripts\activate
-python -m pip install -r requirements.txt
-python ocr_service.py http
+# 1) 一键部署环境: uv → CPython 3.11 venv → 装依赖 → 版本自检
+#    ⚠️ 不要直接拷贝源机器的 .venv: 它不可移植, 在目标机会失效
+bin\deploy_env.bat
+# 2) 一键自检: 依赖 / 模型 / 真实识别 / HTTP 端到端
+bin\selftest_ocr.bat
+# 3) 一键运行
+bin\start_http.bat
 ```
 
-首次运行自动下载 ONNX 模型（联网一次）；之后可离线复用。
-开机自启见仓库 `bin\install_scheduled_task.bat`。
+首次运行（或首次自检）自动下载 ONNX 模型（联网一次，约 146MB）；之后可离线复用。
+哪些目录不必拷贝、内网离线怎么做，见仓库 `README.md` 的「部署到其他设备」小节。
+开机自启见仓库 `bin\install_scheduled_task.bat`（**换机器或换目录后必须重跑**，任务里是绝对路径）。
 
 ## 交互式文档（FastAPI 内置）
 
