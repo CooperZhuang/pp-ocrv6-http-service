@@ -70,7 +70,12 @@ _IDLE_CHECK_INTERVAL = 5.0  # 空闲卸载检查周期(秒)
 # 同一实例并发 predict 不保证线程安全, 用锁串行化推理; 子进程读写在锁内进行
 _OCR_LOCK = threading.Lock()
 
-_CFG_KEYS = ("host", "port", "engine", "device", "idle_unload_s")
+_CFG_KEYS = ("host", "port", "engine", "device", "idle_unload_s", "det_limit_side_len")
+
+# 文本检测输入边长上限(PaddleOCR 的 text_det_limit_side_len, 默认 960).
+# 整页送进来时检测阶段会先把长边缩到该值——票据上的小字(手写成本中心/泛微号)会因此变糊。
+# 调大能改善小字检出, 代价是 CPU 推理耗时随像素数上升(见 README「识别精度与耗时调参」).
+DET_LIMIT_SIDE_LEN_DEFAULT = 960
 
 
 def _resolve_device(device: str, engine: str = "onnxruntime") -> str:
@@ -289,11 +294,17 @@ class _WorkerEngine:
     """
 
     def __init__(
-        self, engine: str = "onnxruntime", device: str = "auto", idle_unload_s: float = 60.0
+        self,
+        engine: str = "onnxruntime",
+        device: str = "auto",
+        idle_unload_s: float = 60.0,
+        det_limit_side_len: int | None = None,
     ) -> None:
         self.engine = engine
         self.device = _resolve_device(device, engine)
         self.idle_unload_s = float(idle_unload_s)
+        # None = 不传该参数(沿用 PaddleOCR 默认 960); 显式给值则透传给推理子进程
+        self.det_limit_side_len = det_limit_side_len
         self._proc: subprocess.Popen | None = None
         self._lock = threading.Lock()
         self._last_use = time.monotonic()
@@ -308,6 +319,8 @@ class _WorkerEngine:
         script = os.path.abspath(__file__)
         repo = os.path.dirname(script)
         cmd = [sys.executable, script, "serve", "--engine", self.engine, "--device", self.device]
+        if self.det_limit_side_len is not None:
+            cmd += ["--det-limit-side-len", str(int(self.det_limit_side_len))]
         self._proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -327,7 +340,8 @@ class _WorkerEngine:
             _LOG.error("推理子进程启动失败 (engine=%s device=%s)", self.engine, self.device)
             self._kill()
             raise RuntimeError("推理子进程启动失败")
-        _LOG.info("推理子进程已启动 (engine=%s device=%s)", self.engine, self.device)
+        _LOG.info("推理子进程已启动 (engine=%s device=%s det_limit=%s)",
+                  self.engine, self.device, self.det_limit_side_len or "默认960")
 
     def _kill(self) -> None:
         """终止当前子进程(若有). 调用方需持有 self._lock."""
@@ -401,9 +415,13 @@ def serve(argv: list[str] | None = None) -> int:
     响应一行:             {"id": <int>, "ok": true, "pages": [...]} 或 {"id":..., "ok":false, "error":...}
     退出:                 {"shutdown": true}
     就绪握手:             首行 {"id": 0, "ready": true}
+
+    可选参数 --det-limit-side-len <int>: 透传 PaddleOCR 的 text_det_limit_side_len
+    (检测阶段输入长边上限, 默认 960); HTTP 服务的推理子进程由 _WorkerEngine 传进来.
     """
     device = "auto"
     engine = "onnxruntime"
+    det_limit: int | None = None
 
     # 统一 stdin/stdout 为 UTF-8(Windows 默认 gbk 无法编码中文/¥ 等), 保证 JSON 桥可靠.
     for _s in (sys.stdin, sys.stdout):
@@ -419,8 +437,13 @@ def serve(argv: list[str] | None = None) -> int:
             elif a == "--engine":
                 with contextlib.suppress(StopIteration):
                     engine = next(it)
+            elif a == "--det-limit-side-len":
+                with contextlib.suppress(StopIteration, ValueError):
+                    det_limit = int(next(it))
     try:
-        engine_obj = ocr(device=device, engine=engine)
+        engine_obj = ocr(device=device, engine=engine,
+                         **({"text_det_limit_side_len": det_limit}
+                            if det_limit is not None else {}))
     except Exception as e:  # noqa: BLE001
         print(f"[serve] 引擎初始化失败: {e}", file=sys.stderr)
         return 1
@@ -587,24 +610,35 @@ def serve_http(argv: list[str] | None = None) -> int:
         default=60.0,
         help="空闲多少秒后杀掉推理子进程(子进程隔离, 省内存); 0=不杀, 默认 60",
     )
+    parser.add_argument(
+        "--det-limit-side-len",
+        type=int,
+        default=None,
+        help=("文本检测输入长边上限(默认 960, 即 PaddleOCR 默认). 票据小字/手写认不全时可调大"
+              "(如 1280/1600): 检出更稳, 但 CPU 单页耗时随像素数上升. 也可写进 config.json "
+              "的 det_limit_side_len"),
+    )
     parser.set_defaults(**{k: cfg[k] for k in _CFG_KEYS if k in cfg})
     args = parser.parse_args(argv)
 
     # 配置日志 (文件轮转 + 有真实控制台时输出), 级别来自 config.json log_level
     _setup_logging(level=cfg.get("log_level", "info"))
     _LOG.info(
-        "启动 HTTP 服务: host=%s port=%s engine=%s device=%s idle_unload=%ss",
+        "启动 HTTP 服务: host=%s port=%s engine=%s device=%s idle_unload=%ss det_limit=%s",
         args.host,
         args.port,
         args.engine,
         args.device,
         args.idle_unload,
+        args.det_limit_side_len or f"默认({DET_LIMIT_SIDE_LEN_DEFAULT})",
     )
 
     # 惰性导入(仅 uvicorn): 保证 `import ocr_service` 无需 fastapi
     import uvicorn
 
-    worker = _WorkerEngine(engine=args.engine, device=args.device, idle_unload_s=args.idle_unload)
+    worker = _WorkerEngine(engine=args.engine, device=args.device,
+                           idle_unload_s=args.idle_unload,
+                           det_limit_side_len=args.det_limit_side_len)
 
     stop_event = threading.Event()
     if args.idle_unload > 0:
@@ -633,6 +667,12 @@ def _add_common_http_args(parser: argparse.ArgumentParser) -> None:
         "--device",
         default="auto",
         help="推理设备: auto(onnxruntime 默认 cpu; paddle 有 CUDA 则 gpu:0, 否则 cpu) / cpu / gpu:0",
+    )
+    parser.add_argument(
+        "--det-limit-side-len",
+        type=int,
+        default=None,
+        help="文本检测输入长边上限(默认 960). 票据小字/手写认不全时可调大(如 1280/1600)",
     )
 
 
@@ -675,6 +715,8 @@ def main(argv: list[str] | None = None) -> int:
         enable_mkldnn=args.enable_mkldnn,
         use_doc_orientation_classify=not args.no_doc_orientation,
         use_textline_orientation=not args.no_textline_orientation,
+        **({"text_det_limit_side_len": args.det_limit_side_len}
+           if args.det_limit_side_len is not None else {}),
     )
 
     total_lines = 0

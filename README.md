@@ -22,7 +22,7 @@
 ```
 .
 ├── ocr_service.py            # 核心模块 + CLI + HTTP 服务
-├── config.json               # 服务配置 (host/port/engine/device/idle_unload_s/log_level)
+├── config.json               # 服务配置 (host/port/engine/device/idle_unload_s/det_limit_side_len/log_level)
 ├── requirements.txt          # 运行依赖
 ├── requirements-dev.txt      # 开发/测试依赖
 ├── pyproject.toml            # 项目元数据 + pytest/mypy/coverage/ruff 配置
@@ -51,6 +51,7 @@
   "engine": "onnxruntime",
   "device": "auto",
   "idle_unload_s": 60,
+  "det_limit_side_len": 960,
   "log_level": "info"
 }
 ```
@@ -62,7 +63,33 @@
 | `engine` | `onnxruntime` | 推理引擎：`onnxruntime`（免GPU）/ `paddle`（GPU更快） |
 | `device` | `auto` | 设备：`auto`/`cpu`/`gpu:0` |
 | `idle_unload_s` | `60` | 空闲多少秒后杀掉推理子进程；`0`=不杀 |
+| `det_limit_side_len` | `960` | 文本检测输入长边上限（PaddleOCR 的 `text_det_limit_side_len`）；调大可改善票据小字/手写识别，代价是耗时上升 |
 | `log_level` | `info` | 日志级别：`debug`/`info`/`warning`/`error` |
+
+## 识别精度与耗时调参（`det_limit_side_len`）
+
+PaddleOCR 的检测阶段会先把输入图的长边缩到 `det_limit_side_len`（默认 **960**）：一张
+2340×1654 的票据送进来，检测时只剩 **0.41×**，备注栏那种小字手写容易漏笔画/漏末位。
+调大它能让检测阶段保留更多细节（识别阶段本来就从原图裁框取像素，两者叠加）。
+
+实测（同一台 CPU 机器、onnxruntime、8 张真实住宿票，客户已裁定的难例）：
+
+| `det_limit_side_len` | 两字段全对 | 单页中位耗时 | 最慢 |
+| --- | --- | --- | --- |
+| **960（默认）** | 3/8 | **1.4s** | 1.6s |
+| 1280 | 3/8 | 1.5s | 1.8s |
+| **1600** | **4/8** | 1.8s | 2.2s |
+| 2000 | 3/8 | 2.2s | 2.4s |
+
+结论与用法：
+
+- **默认 960 保持不变**：对绝大多数票据够用，且最快；2000 反而更差（+噪声）与更慢。
+- 需要"再认一遍小字"时用 **1600**（`config.json` 改 `det_limit_side_len` 或启动加
+  `--det-limit-side-len 1600`），单页约 +0.4s。
+- 与"裁剪复读"是两条独立的路：抬分辨率对**每一张**都生效但每张都多花 CPU；裁剪复读
+  （调用方 `票据AI识别` 侧实现）只在失败/可疑时才走，只对那一张多花时间。
+- ⚠️ 提高分辨率**不能**解决所有小字问题：实测两张"成本中心漏末位"的票在 960/1280/1600/2000
+  下都读不出最后一位——那类要靠调用方的裁剪复读或多遍读法。
 
 ## 安装（一键）
 

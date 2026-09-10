@@ -6,14 +6,14 @@ import json
 import ocr_service
 
 
-def _run_serve(stdin_text):
+def _run_serve(stdin_text, argv=()):
     stdin = io.StringIO(stdin_text)
     stdout = io.StringIO()
     prev_in, prev_out = ocr_service.sys.stdin, ocr_service.sys.stdout
     ocr_service.sys.stdin = stdin
     ocr_service.sys.stdout = stdout
     try:
-        code = ocr_service.serve([])
+        code = ocr_service.serve(list(argv))
     finally:
         ocr_service.sys.stdin = prev_in
         ocr_service.sys.stdout = prev_out
@@ -42,3 +42,36 @@ def test_serve_retains_request_id_in_error():
     assert code == 0
     lines = [json.loads(line) for line in out.strip().splitlines()]
     assert lines[1]["id"] == 42
+
+
+def test_serve_forwards_det_limit_to_engine(monkeypatch):
+    """--det-limit-side-len 透传给引擎(HTTP 推理子进程靠这条参数提高检测分辨率)."""
+    seen = {}
+
+    class _FakeEngine:
+        def process(self, path):  # noqa: ARG002
+            return []
+
+    def _fake_ocr(**kwargs):
+        seen.update(kwargs)
+        return _FakeEngine()
+
+    monkeypatch.setattr(ocr_service, "ocr", _fake_ocr)
+    code, _ = _run_serve('{"shutdown": true}\n', argv=["--det-limit-side-len", "1600"])
+    assert code == 0
+    assert seen.get("text_det_limit_side_len") == 1600
+    assert seen.get("engine") == "onnxruntime"
+
+
+def test_serve_omits_det_limit_when_not_given(monkeypatch):
+    """不传该参数时不带进引擎参数 -> 沿用 PaddleOCR 默认 960."""
+    seen = {}
+
+    class _FakeEngine:
+        def process(self, path):  # noqa: ARG002
+            return []
+
+    monkeypatch.setattr(ocr_service, "ocr",
+                        lambda **kw: (seen.update(kw), _FakeEngine())[1])
+    _run_serve('{"shutdown": true}\n')
+    assert "text_det_limit_side_len" not in seen

@@ -21,6 +21,8 @@
 
 ```bash
 .venv\Scripts\python.exe ocr_service.py http --port 18010 --engine onnxruntime --device auto --idle-unload 60
+# 票据小字（手写金额/编号）认不全时，可提高文本检测分辨率：
+.venv\Scripts\python.exe ocr_service.py http --det-limit-side-len 1600
 ```
 
 ## 配置 (config.json)
@@ -32,6 +34,7 @@
 | `engine` | `onnxruntime` | 推理引擎：`onnxruntime`（免GPU）` `paddle`（GPU更快，需装 paddle） |
 | `device` | `auto` | 推理设备：`auto`/`cpu`/`gpu:0` |
 | `idle_unload_s` | `60` | 空闲多少秒后杀掉推理子进程；`0`=不杀 |
+| `det_limit_side_len` | `960` | 文本检测输入长边上限（PaddleOCR 的 `text_det_limit_side_len`）。整页送识别时检测阶段会先把长边缩到该值，**票据上的小字/手写会因此变糊**；调到 `1280`/`1600` 可改善检出，代价是单页 CPU 耗时上升（见 README「识别精度与耗时调参」实测表） |
 | `log_level` | `info` | 日志级别：`debug`/`info`/`warning`/`error` |
 
 服务日志写到 `logs\ocr_service.log`（按大小轮转），记录启动、推理子进程启停、每次识别结果（ok/页数/行数/耗时）与错误；无窗口后台运行也落盘。

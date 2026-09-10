@@ -84,6 +84,26 @@ def test_process_raises_when_child_fails(worker):
         worker.process("x.png")
 
 
+def test_spawn_passes_det_limit_when_set():
+    """设了 det_limit_side_len -> 推理子进程命令行带上该参数(票据小字识别用)."""
+    w = _WorkerEngine(engine="onnxruntime", device="cpu", idle_unload_s=10,
+                      det_limit_side_len=1600)
+    proc = FakeProc(stdout_lines=[READY, OK])
+    with patch.object(ocr_service.subprocess, "Popen", return_value=proc) as m:
+        w.process("x.png")
+    cmd = m.call_args[0][0]
+    assert "--det-limit-side-len" in cmd
+    assert cmd[cmd.index("--det-limit-side-len") + 1] == "1600"
+
+
+def test_spawn_omits_det_limit_by_default(worker):
+    """没配就不传 -> 沿用 PaddleOCR 默认 960, 行为与改造前一致."""
+    proc = FakeProc(stdout_lines=[READY, OK])
+    with patch.object(ocr_service.subprocess, "Popen", return_value=proc) as m:
+        worker.process("x.png")
+    assert "--det-limit-side-len" not in m.call_args[0][0]
+
+
 def test_unload_if_idle_kills_after_timeout(worker):
     proc = FakeProc(stdout_lines=[READY])
     worker._proc = proc  # type: ignore[assignment]

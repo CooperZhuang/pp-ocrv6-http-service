@@ -37,3 +37,8 @@ def test_resolve_config_path_relative_points_to_script_dir():
 def test_resolve_config_path_absolute_passthrough(tmp_path):
     p = tmp_path / "abs.json"
     assert ocr_service._resolve_config_path(str(p)) == str(p)
+
+
+def test_det_limit_side_len_is_a_config_key():
+    """检测分辨率开关要能被 config.json 设置(部署机改配置即可, 不必改启动脚本)."""
+    assert "det_limit_side_len" in ocr_service._CFG_KEYS
