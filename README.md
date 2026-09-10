@@ -25,7 +25,6 @@
 ├── config.json               # 服务配置 (host/port/engine/device/idle_unload_s/log_level)
 ├── requirements.txt          # 运行依赖
 ├── requirements-dev.txt      # 开发/测试依赖
-├── prepare_env.bat           # 环境准备脚本 (无 uv 时的 pip 回退路径)
 ├── pyproject.toml            # 项目元数据 + pytest/mypy/coverage/ruff 配置
 ├── API.md                    # HTTP 服务调用方接口文档
 ├── models/                   # 模型缓存 (PaddleX, 首次运行自动下载; 已 gitignore)
@@ -70,13 +69,16 @@
 ```bash
 bin\deploy_env.bat             # 推荐: 检查 uv → 建 CPython 3.11 venv → 装依赖 → 自检
 bin\deploy_env.bat --recreate  # 删掉 .venv 重建 (依赖装坏时用; 重建后 GPU 版 paddle 需按下文重装)
+bin\deploy_env.bat --pip       # 强制走 pip 回退 (机器上没有 uv 时)
 bin\deploy_env.bat --no-pause  # 供脚本调用时不暂停
 ```
 
 - 目标机只需要 **uv** + **互联网**：uv 会自动下载 **CPython 3.11**（本项目验证版本），
   **不必预装 Python**。没有 uv 时脚本会直接报错并给出安装命令。
-- 无 uv 的老机器可用 `prepare_env.bat`（pip 回退路径，要求系统已有 Python 3.11）。
-- 默认引擎是 `onnxruntime`，**不需要** paddlepaddle / CUDA；磁盘约需 venv ~3GB + 模型 ~146MB。
+- **没有 uv 的机器会自动回退**到系统 `python` + pip（也可用 `--pip` 强制）：要求系统已有
+  Python 3.11~3.13，其中 3.12/3.13 会告警（仅 3.11 验证过），低于 3.11 或高于 3.13 直接拒绝
+  并提示改装 uv。
+- 默认引擎是 `onnxruntime`，**不需要** paddlepaddle / CUDA；磁盘约需 venv ~0.6GB（实测全新安装 534MB；装了 GPU 版 paddle 才会到 3GB+）+ 模型 ~146MB。
 
 首次运行（或首次自检）自动下载 ONNX 模型到仓库 `models/` 目录（联网一次，之后离线复用）。
 完整的跨机器部署流程（哪些目录不用拷、内网离线怎么办）见下文「部署到其他设备」。
@@ -224,6 +226,7 @@ bin\install_scheduled_task.bat
 | 目标 8GB VM 的绝对耗时 | ⚠️ 未实测：按单核瓶颈推算 A4 整页约 6~9s，落地后用 `bin\selftest_ocr.bat` 现场确认 |
 | 无 paddlepaddle 环境跑 ONNX 引擎 | ✅ 屏蔽 `paddle` 模块后真实推理仍通过 |
 | `--engine paddle` 的 0.64s / 19.6s | ⚠️ 本轮未复测（只跑了 `onnxruntime` 引擎，GPU 数值沿用原文档） |
+| 无 uv 的 pip 回退路径 | ✅ 端到端实测（无 uv + CPython 3.11）：建 venv → 装 78 个包 → 自检 `ocr_service import OK`，exit 0，6 分钟，venv 534MB；3.14 上版本门禁实测会拒绝并自动删除刚建的 venv；3.12/3.13 只验证到依赖可解析 |
 
 ## 开发 / 测试
 
@@ -249,6 +252,10 @@ textline_ori/doc_ori，共约 **146MB**）；同名非 `_onnx` 目录（Paddle �
 
 改完代码请至少跑一遍 `bin\selftest_ocr.bat`，它覆盖了「真实模型 + HTTP 端到端」这条
 最容易出问题、单测又覆盖不到的路径。
+
+改 `bin\*.bat` 时务必保持 **CRLF** 行尾（`.gitattributes` 已用 `*.bat text eol=crlf` 钉死）：
+LF-only 的批处理文件在文件变大后会被 `cmd.exe` 按错位块解析，把注释和 echo 当成命令执行
+（8KB 的 `deploy_env.bat` 踩过这个坑，小脚本只是侥幸没事）。
 
 ## License
 
