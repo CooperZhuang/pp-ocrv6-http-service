@@ -22,7 +22,7 @@
 ```
 .
 ├── ocr_service.py            # 核心模块 + CLI + HTTP 服务
-├── config.json               # 服务配置 (host/port/engine/device/idle_unload_s/det_limit_side_len/log_level)
+├── config.json               # 服务配置 (host/port/engine/device/idle_unload_s/det_limit_side_len/timeout_keep_alive/log_level)
 ├── requirements.txt          # 运行依赖
 ├── requirements-dev.txt      # 开发/测试依赖
 ├── pyproject.toml            # 项目元数据 + pytest/mypy/coverage/ruff 配置
@@ -52,6 +52,7 @@
   "device": "auto",
   "idle_unload_s": 60,
   "det_limit_side_len": 960,
+  "timeout_keep_alive": 120,
   "log_level": "info"
 }
 ```
@@ -63,8 +64,38 @@
 | `engine` | `onnxruntime` | 推理引擎：`onnxruntime`（免GPU）/ `paddle`（GPU更快） |
 | `device` | `auto` | 设备：`auto`/`cpu`/`gpu:0` |
 | `idle_unload_s` | `60` | 空闲多少秒后杀掉推理子进程；`0`=不杀 |
+| `timeout_keep_alive` | `120` | keep-alive 连接空闲超时（秒，必须为正数；非法值退回 120）。**不再用 uvicorn 默认的 5s**，原因见「keep-alive 连接超时」一节 |
 | `det_limit_side_len` | `960` | 文本检测输入长边上限（PaddleOCR 的 `text_det_limit_side_len`）。整页送识别时检测阶段会先把长边缩到该值，**票据上的小字/手写会因此变糊**；调到 `1280`/`1600` 可改善检出，代价是单页 CPU 耗时上升（见下节实测表）。**本仓库 `config.json` 现设为 `1600`**（2026-09-11，票据小字场景），代码默认值仍是 960 |
 | `log_level` | `info` | 日志级别：`debug`/`info`/`warning`/`error` |
+
+## keep-alive 连接超时（`timeout_keep_alive`）
+
+uvicorn 自己的默认值是 **5s**：一条 keep-alive 连接空闲超过 5s，服务端就发 FIN 关掉它。
+调用方（`票据AI识别`）**每线程复用一条 keep-alive 连接**，于是存在这样的毫秒级竞态：
+
+1. 连接空闲 >5s，服务端已经发了 FIN，客户端还没处理到；
+2. 客户端此时正好发 `POST /ocr`；
+3. 请求撞上一条已经关闭的连接 → Windows 客户端收到 **10054（连接被重置）**。
+
+2026-10-24 00:31:11 生产环境出现过一次这种 POST 收到 RST（约占当天请求的 0.34%）；
+服务端日志里没有任何记录，因为连接在请求体/响应阶段就被重置了。因此本服务默认把
+`timeout_keep_alive` 放宽到 **120s**（`config.json` 可改，CLI `--timeout-keep-alive`
+优先于配置），远超调用方的空闲间隔，同一条连接可以安全复用。代价只是服务端多留最多
+120s 的空闲 socket（每条约几十字节），对内存无实际影响。
+
+```bash
+.venv\Scripts\python.exe ocr_service.py http --timeout-keep-alive 120   # 默认值
+```
+
+> 120s 不是"越大越好"的魔法值：它要**大于调用方两次请求之间的最大空闲时间**。
+> 若调用方把空闲间隔拉得更长，这个值也应一起改大。
+
+配套的可观测性（详见 [`API.md`](API.md)「就绪探测」）：`GET /health` 返回
+`requests_total` / `requests_failed` / `last_request_ts`；客户端断开或处理异常会
+同时记一条 warning（带异常类型）。下次再遇到 10054 时，能先分清「请求根本没到服务端」
+还是「到了但连接被重置」。`logs\ocr_service.log` 里 uvicorn 访问行照常记录每个完成
+的请求；请求体传输中被重置时没有响应可记，由那条 warning 补上（`log_level` 需为
+`info`；请求进入/单文件大小的细粒度日志需设为 `debug`）。
 
 ## 识别精度与耗时调参（`det_limit_side_len`）
 
@@ -141,7 +172,7 @@ uv pip install --python <venv-python> --index-url https://www.paddlepaddle.org.c
 
 ```bash
 .venv\Scripts\python.exe ocr_service.py http            # 读取 config.json
-curl -s http://127.0.0.1:18010/health                   # {"ok":true,"device":"cpu","engine":"onnxruntime","model_loaded":false}
+curl -s http://127.0.0.1:18010/health                   # 含 model_loaded 与 requests_total/requests_failed/last_request_ts 计数
 curl -s -X POST http://127.0.0.1:18010/ocr -F "files=@a.png" -F "files=@b.png"
 ```
 
@@ -206,7 +237,8 @@ bin\install_scheduled_task.bat --remove   # 卸载
 bin\stop_service.bat / bin\start_http.bat # 手动停止/启动
 ```
 
-日志：`logs\ocr_service.log`（按大小轮转），记录启动、推理子进程启停、每次识别结果与错误。
+日志：`logs\ocr_service.log`（按大小轮转），记录启动、推理子进程启停、每次识别结果与错误；
+客户端在 `/ocr` 处理中断开连接时额外记一条 warning（见「keep-alive 连接超时」）。
 
 ## 部署到其他设备
 

@@ -4,6 +4,7 @@ import json
 import os
 
 import ocr_service
+import pytest
 
 
 def test_load_valid_json(tmp_path):
@@ -42,3 +43,20 @@ def test_resolve_config_path_absolute_passthrough(tmp_path):
 def test_det_limit_side_len_is_a_config_key():
     """检测分辨率开关要能被 config.json 设置(部署机改配置即可, 不必改启动脚本)."""
     assert "det_limit_side_len" in ocr_service._CFG_KEYS
+
+
+def test_timeout_keep_alive_is_a_config_key():
+    """keep-alive 超时要能被 config.json 设置(部署机改配置即可, 不必改启动脚本)."""
+    assert "timeout_keep_alive" in ocr_service._CFG_KEYS
+    assert ocr_service.TIMEOUT_KEEP_ALIVE_DEFAULT == 120
+
+
+@pytest.mark.parametrize("value,expected", [(1, 1.0), ("30", 30.0), (2.5, 2.5), (600, 600.0)])
+def test_resolve_timeout_keep_alive_accepts_positive(value, expected):
+    assert ocr_service._resolve_timeout_keep_alive(value) == expected
+
+
+@pytest.mark.parametrize("bad", [0, -1, -0.5, float("nan"), float("inf"), "abc", None, {}, []])
+def test_resolve_timeout_keep_alive_falls_back_on_invalid(bad):
+    """0/负数/NaN/Inf/非数字 -> 退回默认 120s, 不把非法值交给 uvicorn."""
+    assert ocr_service._resolve_timeout_keep_alive(bad) == ocr_service.TIMEOUT_KEEP_ALIVE_DEFAULT

@@ -4,6 +4,7 @@
   "engine": "onnxruntime",
   "device": "auto",
   "idle_unload_s": 60,
+  "timeout_keep_alive": 120,
   "det_limit_side_len": 1600,
   "log_level": "info"
 }

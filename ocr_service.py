@@ -24,12 +24,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+from datetime import UTC, datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -70,7 +72,21 @@ _IDLE_CHECK_INTERVAL = 5.0  # 空闲卸载检查周期(秒)
 # 同一实例并发 predict 不保证线程安全, 用锁串行化推理; 子进程读写在锁内进行
 _OCR_LOCK = threading.Lock()
 
-_CFG_KEYS = ("host", "port", "engine", "device", "idle_unload_s", "det_limit_side_len")
+_CFG_KEYS = (
+    "host",
+    "port",
+    "engine",
+    "device",
+    "idle_unload_s",
+    "det_limit_side_len",
+    "timeout_keep_alive",
+)
+
+# keep-alive 连接空闲超时(秒). uvicorn 自己的默认值是 5s: 调用方(票据AI识别)每线程复用一个
+# keep-alive 连接, 空闲超过 5s 服务端就发 FIN 关连接; 客户端若在 FIN 已发出、自己还没察觉的
+# 毫秒级窗口里发 POST, 就会撞上一条已经关闭的连接(Windows 客户端表现为 10054 RST).
+# 2026-10-24 生产出现过这种失败(0.34%), 因此默认放宽到 120s.
+TIMEOUT_KEEP_ALIVE_DEFAULT = 120
 
 # 文本检测输入边长上限(PaddleOCR 的 text_det_limit_side_len, 默认 960).
 # 整页送进来时检测阶段会先把长边缩到该值——票据上的小字(手写成本中心/泛微号)会因此变糊。
@@ -96,6 +112,25 @@ def _resolve_device(device: str, engine: str = "onnxruntime") -> str:
     except Exception:  # noqa: BLE001
         pass
     return "cpu"
+
+
+def _resolve_timeout_keep_alive(value: Any) -> float:
+    """校验 timeout_keep_alive: 只接受有限正数(秒), 非法值退回默认并告警.
+
+    0/负数/NaN/Inf/非数字都无法让 uvicorn 正常表现, 直接退回默认 120s,
+    避免把非法值原样传给 uvicorn 后连接行为不可预期.
+    """
+    try:
+        val = float(value)
+    except (TypeError, ValueError):
+        _LOG.warning("timeout_keep_alive 非法(%r), 使用默认 %ss", value, TIMEOUT_KEEP_ALIVE_DEFAULT)
+        return float(TIMEOUT_KEEP_ALIVE_DEFAULT)
+    if not math.isfinite(val) or val <= 0:
+        _LOG.warning(
+            "timeout_keep_alive 必须是正数(%r), 使用默认 %ss", value, TIMEOUT_KEEP_ALIVE_DEFAULT
+        )
+        return float(TIMEOUT_KEEP_ALIVE_DEFAULT)
+    return val
 
 
 def _load_config(path: str) -> dict[str, Any]:
@@ -492,6 +527,106 @@ def _process_locked(engine: _WorkerEngine, path: str) -> list[dict[str, Any]]:
         return engine.process(path)
 
 
+# ======================================================================
+#  运行计数(/health): 让「客户端说失败、服务端日志空白」可分辨
+# ======================================================================
+class _RequestStats:
+    """HTTP /ocr 的运行计数, 由 /health 输出.
+
+    用途: 下次「客户端说请求失败、服务端日志却什么都没有」时, 先看这里——
+    requests_total 没涨 = 请求根本没到本服务(客户端/网络/端口问题);
+    涨了但 requests_failed 也涨 = 请求到了, 但连接被重置/处理异常.
+
+    - requests_total: 到达 /ocr 的请求数. 在请求体解析之前计数, 所以客户端
+      上传到一半就断开也算一次; /health、/docs 等其它路径不计.
+    - requests_failed: 请求级失败数(处理中抛异常、客户端断开、响应 5xx).
+      单个文件识别失败(整批仍 200 且该项 ok:false)不算, 那有单独的 error 日志.
+    - last_request_ts: 最近一次 /ocr 请求到达时间, ISO 8601 UTC 字符串
+      (如 "2026-10-26T01:31:11.482+00:00"); 从未收到过为 null.
+    - last_failure_ts / last_failure_reason: 最近一次请求级失败的时间与原因(便于定位).
+    全程加锁; 每请求一次加锁, 相对秒级 OCR 耗时开销可忽略.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._total = 0
+        self._failed = 0
+        self._last_ts: str | None = None
+        self._last_failure_ts: str | None = None
+        self._last_failure_reason: str | None = None
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(UTC).isoformat(timespec="milliseconds")
+
+    def record_request(self) -> None:
+        with self._lock:
+            self._total += 1
+            self._last_ts = self._now_iso()
+
+    def record_failure(self, reason: str) -> None:
+        with self._lock:
+            self._failed += 1
+            self._last_failure_ts = self._now_iso()
+            self._last_failure_reason = reason
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "requests_total": self._total,
+                "requests_failed": self._failed,
+                "last_request_ts": self._last_ts,
+                "last_failure_ts": self._last_failure_ts,
+                "last_failure_reason": self._last_failure_reason,
+            }
+
+
+# 客户端断开/连接重置时可能冒出来的异常类名(Starlette 抛 ClientDisconnect, 其余是 OS 层)
+_CLIENT_GONE_ERRORS = (
+    "ClientDisconnect",
+    "RemoteDisconnected",
+    "ConnectionResetError",
+    "ConnectionAbortedError",
+    "BrokenPipeError",
+)
+
+
+def _install_request_stats(app: Any, stats: _RequestStats) -> None:
+    """给 /ocr 挂「请求计数 + 客户端断开告警」中间件(见 _RequestStats 说明).
+
+    中间件比路由早执行: 请求体还没解析就先 requests_total +1, 所以客户端在
+    上传途中断开(这种请求原本服务端日志一行都不留)也会留下计数和一条 warning.
+    """
+
+    @app.middleware("http")
+    async def _request_stats_middleware(request: Any, call_next: Any) -> Any:
+        if request.url.path != "/ocr":
+            return await call_next(request)
+        stats.record_request()
+        try:
+            response = await call_next(request)
+        except asyncio.CancelledError:
+            stats.record_failure("请求被取消(客户端断开或服务关闭)")
+            _LOG.warning("客户端在 /ocr 处理中断开连接(task cancelled): client=%s", request.client)
+            raise
+        except Exception as e:  # noqa: BLE001 - 记录后原样抛出, 不改变错误语义
+            reason = f"{type(e).__name__}: {e}"
+            stats.record_failure(reason)
+            if type(e).__name__ in _CLIENT_GONE_ERRORS:
+                _LOG.warning(
+                    "客户端在 /ocr 请求中断开连接(请求体可能未收全): %s client=%s",
+                    reason,
+                    request.client,
+                )
+            else:
+                _LOG.exception("/ocr 请求异常中断: %s client=%s", reason, request.client)
+            raise
+        if response.status_code >= 500:
+            stats.record_failure(f"HTTP {response.status_code}")
+            _LOG.error("/ocr 返回 HTTP %d", response.status_code)
+        return response
+
+
 def build_app(
     worker: Any,
     title: str = "PP-OCRv6 OCR Service",
@@ -509,19 +644,24 @@ def build_app(
     globals().update(UploadFile=UploadFile, File=File)
 
     app = FastAPI(title=title, description=description, version=version)
+    stats = _RequestStats()
+    _install_request_stats(app, stats)
 
     @app.get("/health")
     def health() -> dict[str, Any]:
-        return {
+        body: dict[str, Any] = {
             "ok": True,
             "device": worker.device,
             "engine": worker.engine,
             "model_loaded": worker.model_loaded,
         }
+        body.update(stats.snapshot())
+        return body
 
     @app.post("/ocr")
     async def ocr_endpoint(files: list[UploadFile] = File(...)) -> dict[str, Any]:
         results: list[dict[str, Any]] = []
+        _LOG.debug("/ocr 请求进入: 文件数=%d", len(files))
         for f in files:
             name = f.filename or "upload"
             suffix = Path(name).suffix.lower()
@@ -539,6 +679,7 @@ def build_app(
             start = time.perf_counter()
             try:
                 data = await f.read()
+                _LOG.debug("/ocr 文件 %s: %d 字节 (扩展名 %s)", name, len(data), suffix or "(none)")
                 # delete=False: 文件在 with 退出后仍保留, 供 worker 推断; 之后 finally 清理
                 with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
                     tmp.write(data)
@@ -618,19 +759,37 @@ def serve_http(argv: list[str] | None = None) -> int:
               "(如 1280/1600): 检出更稳, 但 CPU 单页耗时随像素数上升. 也可写进 config.json "
               "的 det_limit_side_len"),
     )
+    parser.add_argument(
+        "--timeout-keep-alive",
+        type=float,
+        default=float(TIMEOUT_KEEP_ALIVE_DEFAULT),
+        help=(
+            "keep-alive 连接空闲超时(秒), 默认 120. uvicorn 自己的默认是 5s: 空闲超过 5s "
+            "服务端就发 FIN 关连接, 调用方复用该连接时可能撞上已关闭的连接(10054 RST). "
+            "必须是正数; 也可写进 config.json 的 timeout_keep_alive"
+        ),
+    )
+    # config.json 里的 timeout_keep_alive 先校验(CLI 覆盖前), 避免非法默认值被 argparse
+    # 的 type 转换直接 SystemExit, 而是退回默认值并告警.
+    if "timeout_keep_alive" in cfg:
+        cfg["timeout_keep_alive"] = _resolve_timeout_keep_alive(cfg["timeout_keep_alive"])
     parser.set_defaults(**{k: cfg[k] for k in _CFG_KEYS if k in cfg})
     args = parser.parse_args(argv)
+    # CLI 侧同样校验(0/负数/NaN 会让 uvicorn 行为不可预期), 非法退回默认
+    timeout_keep_alive = _resolve_timeout_keep_alive(args.timeout_keep_alive)
 
     # 配置日志 (文件轮转 + 有真实控制台时输出), 级别来自 config.json log_level
     _setup_logging(level=cfg.get("log_level", "info"))
     _LOG.info(
-        "启动 HTTP 服务: host=%s port=%s engine=%s device=%s idle_unload=%ss det_limit=%s",
+        "启动 HTTP 服务: host=%s port=%s engine=%s device=%s idle_unload=%ss det_limit=%s "
+        "timeout_keep_alive=%ss",
         args.host,
         args.port,
         args.engine,
         args.device,
         args.idle_unload,
         args.det_limit_side_len or f"默认({DET_LIMIT_SIDE_LEN_DEFAULT})",
+        timeout_keep_alive,
     )
 
     # 惰性导入(仅 uvicorn): 保证 `import ocr_service` 无需 fastapi
@@ -649,7 +808,15 @@ def serve_http(argv: list[str] | None = None) -> int:
     # 启动时卸载(首请求)前的空闲不计入监听场景; 仅关闭时清理子进程
     try:
         # log_config=None: 让 uvicorn 的访问/错误日志走根日志器(即 logs/ocr_service.log)
-        uvicorn.run(app, host=args.host, port=args.port, log_config=None)
+        # timeout_keep_alive: 不传则 uvicorn 用默认 5s, 空闲复用连接会被服务端关闭(10054 RST)
+        uvicorn.run(
+            app,
+            host=args.host,
+            port=args.port,
+            log_config=None,
+            # uvicorn 的注解是 int 秒(运行时交给 asyncio.wait_for, float 也接受)
+            timeout_keep_alive=timeout_keep_alive,  # type: ignore[arg-type]
+        )
     finally:
         stop_event.set()
         worker.shutdown()

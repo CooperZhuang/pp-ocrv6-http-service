@@ -21,6 +21,8 @@
 
 ```bash
 .venv\Scripts\python.exe ocr_service.py http --port 18010 --engine onnxruntime --device auto --idle-unload 60
+# keep-alive 空闲超时（默认 120s；不要退回 uvicorn 的 5s，见「keep-alive 与连接超时」）：
+.venv\Scripts\python.exe ocr_service.py http --timeout-keep-alive 120
 # 票据小字（手写金额/编号）认不全时，可提高文本检测分辨率：
 .venv\Scripts\python.exe ocr_service.py http --det-limit-side-len 1600
 ```
@@ -34,6 +36,7 @@
 | `engine` | `onnxruntime` | 推理引擎：`onnxruntime`（免GPU）` `paddle`（GPU更快，需装 paddle） |
 | `device` | `auto` | 推理设备：`auto`/`cpu`/`gpu:0` |
 | `idle_unload_s` | `60` | 空闲多少秒后杀掉推理子进程；`0`=不杀 |
+| `timeout_keep_alive` | `120` | keep-alive 连接空闲超时（秒，正数；非法值退回 120）。**不用 uvicorn 默认的 5s**，原因见「keep-alive 与连接超时」 |
 | `det_limit_side_len` | `960` | 文本检测输入长边上限（PaddleOCR 的 `text_det_limit_side_len`）。整页送识别时检测阶段会先把长边缩到该值，**票据上的小字/手写会因此变糊**；调到 `1600` 可改善检出，代价是单页 CPU 耗时上升（见 README「识别精度与耗时调参」实测表）。**本仓库 `config.json` 现为 `1600`** |
 | `log_level` | `info` | 日志级别：`debug`/`info`/`warning`/`error` |
 
@@ -46,6 +49,7 @@
   "engine": "onnxruntime",
   "device": "auto",
   "idle_unload_s": 60,
+  "timeout_keep_alive": 120,
   "log_level": "info"
 }
 ```
@@ -87,6 +91,23 @@
 - 首次请求会把推理子进程拉起到常驻 ~0.9GB（提交 ~1.6GB），空闲 `idle_unload_s` 秒后释放，
   所以「空闲后第一个请求」要预留冷启动时间。
 
+## keep-alive 与连接超时
+
+uvicorn 默认 `timeout_keep_alive=5s`：空闲超过 5s 的连接由服务端发 FIN 关闭。
+本服务的调用方（`票据AI识别`）每线程复用一条 keep-alive 连接，若客户端在
+「服务端已发 FIN、自己尚未处理」的毫秒级窗口里发出 `POST /ocr`，就会撞上已关闭的
+连接——Windows 客户端表现为 **10054（连接被重置）**。2026-10-24 00:31:11 生产环境
+出现过一次（约占当天请求 0.34%），且服务端日志当时没有任何记录。
+
+因此：
+
+- 服务端默认 `timeout_keep_alive=120`（`config.json` / `--timeout-keep-alive` 可改，
+  必须为正数，非法值自动退回 120），远大于调用方的空闲间隔。
+- `GET /health` 增加运行计数（见下），配合 `logs\ocr_service.log` 的 warning，
+  下次能区分「请求没到服务端」和「到了但连接被重置」。
+- 客户端断开/请求异常会在日志里留一条 warning，例如：
+  `客户端在 /ocr 请求中断开连接(请求体可能未收全): ClientDisconnect: ...`。
+
 ## 就绪探测
 
 ```
@@ -97,11 +118,35 @@ GET http://127.0.0.1:18010/health
 - 响应 `200`：
 
 ```json
-{"ok": true, "device": "cpu", "engine": "onnxruntime", "model_loaded": false}
+{
+  "ok": true,
+  "device": "cpu",
+  "engine": "onnxruntime",
+  "model_loaded": false,
+  "requests_total": 12,
+  "requests_failed": 1,
+  "last_request_ts": "2026-10-26T01:31:11.482+00:00",
+  "last_failure_ts": null,
+  "last_failure_reason": null
+}
 ```
 
-`device` 为 `"cpu"` 或 `"gpu:0"`；`engine` 为 `"onnxruntime"` 或 `"paddle"`；
-`model_loaded` 表示模型子进程是否已在运行。服务进程启动即就绪（父进程），首请求会加载模型。
+| 字段 | 含义 |
+| --- | --- |
+| `device` | `"cpu"` 或 `"gpu:0"` |
+| `engine` | `"onnxruntime"` 或 `"paddle"` |
+| `model_loaded` | 推理子进程（模型）是否已在运行 |
+| `requests_total` | 到达 `/ocr` 的请求数（在解析请求体之前计数，客户端上传中断开也算；`/health` 自身不计） |
+| `requests_failed` | 请求级失败数：处理中抛异常、客户端断开、响应 5xx。**单个文件识别失败（整批仍 200、该文件 `ok:false`）不计**，那种情况看日志里的 error 行 |
+| `last_request_ts` | 最近一次 `/ocr` 请求到达时间，**ISO 8601 UTC**（如 `2026-10-26T01:31:11.482+00:00`）；从未收到过为 `null` |
+| `last_failure_ts` | 最近一次请求级失败时间（同上格式），从未失败为 `null` |
+| `last_failure_reason` | 最近一次请求级失败原因（如 `ClientDisconnect: ...` / `HTTP 503`），从未失败为 `null` |
+
+字段全是进程内累加值，服务重启归零。用法：客户端报失败而 `requests_total` 没涨
+→ 请求没到本服务（客户端/网络/端口问题）；涨了且 `requests_failed` 同时涨
+→ 请求到了但连接被重置/处理异常，看 `last_failure_reason` 与日志 warning。
+
+服务进程启动即就绪（父进程），首请求会加载模型。
 
 ## 识别
 
